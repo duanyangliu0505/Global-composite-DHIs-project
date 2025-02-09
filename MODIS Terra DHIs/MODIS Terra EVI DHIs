@@ -1,0 +1,184 @@
+/* Author: Elena Razenkova
+Date: 10-26-2021
+Purpose: Calculate the Dynamic Habitat Indices based on NDVI MODIS 1 km
+*/
+
+
+var AOI =  continentalUS; 
+
+//Select date
+var StartDate = '2012-12-02';
+var EndDate= '2020-12-31';
+
+
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+  // Select the QA band.
+  var qa = image.select('DetailedQA')
+  var cloud=qa.bitwiseAnd(1 << 5);  // 0000, 0001, 0010, 0100 [2-5 bits]
+  // Return an image masking out cloudy areas.
+  return image.updateMask(cloud.not());
+  
+}
+
+//A function to remove water.
+var maskWater = function(image) {
+  // Select the QA band.
+  var qa = image.select('DetailedQA')
+  // Make a mask to get bit 10, the internal_cloud_algorithm_flag bit.
+  var water=qa.bitwiseAnd(1 << 13) // 100,101,110,111 [11-13bits]
+            .or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(0 << 12)).and(qa.bitwiseAnd(0 << 11))) //000 [11-13bits] shallow ocean
+.or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(1 << 12)).and(qa.bitwiseAnd(1 << 11)));  // 011 [11-13 bits] shallow inland water
+  // Return an image masking out cloudy areas.
+  return image.updateMask(water.not());
+  
+}
+//Select pixel with snow [bit 14]
+var Snow = function(image) {
+  var qa = image.select('DetailedQA');
+  var snowMask = qa.bitwiseAnd(1 << 14).rename('SnowMask');
+  return image.addBands(snowMask)
+}
+
+//Assign NDVI=0.0001 for pixels with snow/ice 
+var removesnow=function(image){
+  var snow = image.select('SnowMask');
+  var ndvitemp=image.select('NDVI');
+  var snowzero= ndvitemp.where(snow.eq(16384),0)
+return snowzero
+}
+
+//Replace all negative NDVI by 0, because 0<NDVI<1 for vegetation
+var ndvipos=function(image){
+  var ndvitemp=image.select('NDVI');
+  return image.where(ndvitemp.lt(0),0)  
+};
+
+
+
+var NDVI_col= ee.ImageCollection('MODIS/006/MOD13A1')
+                  .filterDate(StartDate,EndDate)
+                  //.filterBounds(AOI)
+                  .map(maskClouds)
+                  .map(maskWater)
+                  .map(Snow)
+                  .map(removesnow) 
+              //.select('NDVI') 
+                  .select('NDVI')
+                  .map(ndvipos);
+
+//Map.addLayer(NDVI_col,{},'NDVI_col'); 
+
+var ndviJan=NDVI_col.first()
+
+Map.addLayer(ndviJan,{},'January');
+
+//To fill data during polar hight 
+var ndvimax = ee.ImageCollection('MODIS/006/MOD13A2')
+                .select('NDVI')
+                .filterDate(StartDate,EndDate)
+                .max();
+//Unmask pixels
+var unmaskdata=function(image){
+  return image.unmask(0)
+} 
+ 
+var ndvi_unmask=NDVI_col.map(unmaskdata);
+//Map.addLayer(ndvi_unmask.first(),{},'unmask');
+
+var ccutter_mask = ndvimax.gt(-10000) 
+//Map.addLayer(ccutter_mask, {}, 'ccutter')
+
+var polarfill=function(image){
+  // return image.where(ndvimax.gt(-1000).and((image.eq(-99))),0)
+  return image.updateMask(ccutter_mask)
+};
+var ndvi_final=ndvi_unmask.map(polarfill);
+//Map.addLayer(ndvi_final.first(),{},'polarfill');
+
+//Select median value over the 12 years at each of the time steps of the MODIS product
+var date = ee.List([1, 17, 33, 49,65,81,97,113,129,145,161,177,193,209,225,241,257,273,289,305,321,337,353]);
+var byDate = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var ndvimedian = ndvi_final
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return ndvimedian
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+print(byDate, 'byDate');
+
+//palette
+var ndviVis = {
+  min: 0.0,
+  max: 9000.0,
+  palette: [
+    'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901',
+    '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01',
+    '012E01', '011D01', '011301'
+  ],
+};
+
+//Display NDVI 
+//Map.addLayer(byDate, ndviVis, 'byDate');
+  
+  
+//Calculate statistics for NDVI                
+var ndvi_stats = byDate.reduce(ee.Reducer.min())
+    .addBands(byDate.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate.reduce(ee.Reducer.sum()))
+    .addBands(byDate.reduce(ee.Reducer.mean()))
+    .addBands(byDate.reduce(ee.Reducer.count())); 
+
+
+//the DHIs
+var CumDHI=ndvi_stats.select(2).rename('DHI_cum')
+Map.addLayer (CumDHI, { }, 'CumDHI');
+
+var MinDHI=ndvi_stats.select(0).rename('DHI_min')
+Map.addLayer (MinDHI, {}, 'MinDHI');
+
+var VarDHI=ndvi_stats.select(1).divide(ndvi_stats.select(3)).multiply(1000).rename('DHI_var')
+Map.addLayer(VarDHI, {},'VarDHI');
+
+
+
+
+
+
+
+
+//Export to drive
+
+// Export.image.toDrive({
+//   image:CumDHI,
+//   description: 'CumDHI_ndvi_Cloud_Water_SnowZero_ndviPos_PolarFill_2013-2020_epsg4326_par_US_v2',
+//   // scale: 1000,
+//   region: AOI,
+//   crs: "EPSG:4326",
+//   crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+//   maxPixels:1e13
+// });
+  
+// Export.image.toDrive({
+//   image:MinDHI,
+//   description: 'MinDHI_ndvi_Cloud_Water_SnowZero_ndviPos_PolarFill_2013-2020_epsg4326_par_US',
+//   // scale: 1000,
+//   region: AOI,
+//   crs: "EPSG:4326",
+//   crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+//   maxPixels:1e13,
+// });
+  
+// Export.image.toDrive({
+//   image:VarDHI,
+//   description: 'VarDHI_ndvi_Cloud_Water_SnowZero_ndviPos_PolarFill_2013-2020_epsg4326_par_US',
+// // scale: 1000,
+//   region: AOI,
+//   crs: "EPSG:4326",
+//   crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+//   maxPixels:1e13,
+// });
+  
+
