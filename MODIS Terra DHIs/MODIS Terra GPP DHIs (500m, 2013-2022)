@@ -1,0 +1,147 @@
+%This code is designed to calculate the MODIS GPP (MYD17A2HGF)
+%composite DHIs from tile data
+%Author: Duanyang Liu
+%Date:2024-08-22
+clc
+clear
+%% step-1, import the tile names over global scale
+tile_names = importdata('global_tiles_new.xlsx');
+[tile_m, tile_n] = size(tile_names);
+main_path = 'Z:\VIIRS V2\VNP13A1A2\MOD17A2HGF_';
+%% step-2, load the VIs data from h5 files.
+%Durning this step, the cloud and snow covered data will be prcessed
+%And the data-loading and processing are conduct by tiles
+missing_tiles = [];
+
+for tile_num = 1:tile_m
+    tile_str = tile_names(tile_num,:);
+    year_median = [];
+    count = 0; 
+    for doy = 1:8:361 
+        count = count + 1; 
+        doy;
+        if doy<10
+            doy_str = strcat('00', string(doy));
+        else
+            if doy<100
+                doy_str = strcat('0', string(doy));
+            else
+                doy_str = string(doy);
+            end
+        end
+        %For each tile on each doy date, loading the ten years data 
+        %and select the median value
+        doy_data = [];        
+        for year = 2013:2022            
+            year_str = string(year);
+            %creat the keyword of target file path
+            file_key = strcat('MOD17A2HGF.A',year_str,doy_str,'*',tile_str,'*.hdf');
+            file_path_key = strcat(main_path,year_str,'\',file_key)
+            target_file = dir(file_path_key);
+            if isempty(target_file)
+                missing_feature = strcat(tile_str,'_',doy_str,'_',year_str);
+                %print the missing tile and observation date
+                missing_tiles = [missing_tiles; missing_feature]
+                pro_vi_data = zeros(2400,2400)*NaN;
+                doy_data = [doy_data,pro_vi_data(:)];
+                continue
+            else
+                target_file_path = strcat(main_path,year_str,'\',target_file(1).name);
+                %read the GPP data
+                vi_data = hdfread(target_file_path,'Gpp_500m');
+                %read the corresponding QA data
+                qa_data = hdfread(target_file_path,'/Psn_QC_500m');
+                pro_vi_data = double(vi_data);
+                %valid rang 0 - 30000, scale factor 0.0001                
+                pro_vi_data(pro_vi_data<0) = 0;
+                pro_vi_data(pro_vi_data>30000) = NaN;
+                %convert the qa data to binary, with consistent length 8
+                qa_data_binary = dec2bin(qa_data,8);
+                %the scale factor is 0.0001
+                pro_vi_data = double(vi_data)./10000;
+                pro_vi_data(pro_vi_data>3) = NaN;
+                %for snow/ice covered data, set as 0
+                %snow_index = qa_data_binary(:,7);
+                %snow_index = double(snow_index) - double('0');
+                %snow_index = reshape(snow_index,2400,2400);
+                %pro_vi_data(snow_index == 1) = 0;
+                %for cloud covered data, set as NaN
+                cloud_index = qa_data_binary(:,4:5);
+                %only '00' is clear pixel (no cloud)
+                cloud_index = double(cloud_index) - double('00');
+                cloud_index = sum(cloud_index,2);
+                cloud_index = reshape(cloud_index,2400,2400);
+                %pro_vi_data(cloud_index > 0) = NaN;
+                doy_data = [doy_data,pro_vi_data(:)];
+            end           
+        end
+        %% step-3, select the median value on each DOY
+        %Before select the median value, I will skip the tiles, whihc have
+        %missing value on observation date.        
+        % n=10 means this tile has complete observation, no missing data 
+        %nanmedian function will select the median values without effect by
+        %NaN value, but this function will calculate by column, so,
+        %transposition is needed before application
+        median_data = nanmedian(doy_data');
+        median_data = median_data';
+        median_data = reshape(median_data, 2400,2400);
+        year_median(:,:,count) = median_data;
+    end
+    
+    %% step-4, calculate the composite DHIs and scale cum and min DHIs
+
+    cum_data = nansum(year_median,3);
+    min_data = nanmin(year_median,[],3);
+    mean_data = nanmean(year_median,3);
+    std_data = nanstd(year_median,0,3);
+    var_data = std_data./mean_data;
+    %the max GPP is 3, min GPP is 0
+    scale_cum_data = cum_data./(46*3)*100;
+    scale_min_data = min_data./3*100;
+    scale_var_data = var_data;
+
+    %% step-5, mask the water body by MCD12Q1.061 product (Land Cover Type1,2018)
+    land_cover_main = 'Z:\VIIRS V2\VNP13A1A2\MCD12Q1\';
+    land_cover_key = strcat(land_cover_main,'*',tile_str,'*.hdf');
+    land_cover_key = cell2mat(land_cover_key);
+    land_cover_info = dir(land_cover_key);
+    if isempty(land_cover_info)
+        land_cover_data = ones(2400,2400);
+    else
+        land_cover_path = strcat(land_cover_main,land_cover_info.name);
+        land_cover_data = hdfread(land_cover_path,'LC_Type1');
+    end        
+    %mask the water body
+    scale_cum_data(land_cover_data==17) =NaN;
+    scale_min_data(land_cover_data==17) =NaN;
+    scale_var_data(land_cover_data==17) =NaN;
+
+    %% step-6, save the DHIs reuslts
+    tiff_main_path = 'Z:\VIIRS V2\VNP13A1A2\2015\tiff_2015\';
+    tiff_key = strcat(tiff_main_path,'*2015193.',tile_str,'*.tif');
+    tiff_key = cell2mat(tiff_key);
+    tiff_info = dir(tiff_key);
+    tiff_file_path = strcat(tiff_main_path,tiff_info.name);
+    [evi_data, R] = geotiffread(tiff_file_path);
+    info = geotiffinfo(tiff_file_path);
+    %out_main = ['Y:\Duanyang\DuanyangLiu\PhD\global DHIs project\global DHIs' ...
+    %    '\Global_DHIs_scaled\MODIS Collection 6.1\MODIS Collection 6.1 Aqua'...
+    %    '\MODIS Collection 6.1 Aqua GPP\MODIS Collection 6.1 Aqua GPP 500m 2013-2022\DHIs_data\tile_data\'];
+    %cum_name = strcat(out_main,'Cum_',tile_str,'_MODIS_Aqua_GPP_2013_2022.tif');
+    %cum_name = cell2mat(cum_name);
+    %min_name = strcat(out_main,'Min_',tile_str,'_MODIS_Aqua_GPP_2013_2022.tif');
+    %min_name = cell2mat(min_name);
+    %var_name = strcat(out_main,'Var_',tile_str,'_MODIS_Aqua_GPP_2013_2022.tif');
+    %var_name = cell2mat(var_name);
+    out_main = 'V:\Duanyang\DuanyangLiu\PhD\global DHIs project\global DHIs\Global_DHIs_scaled\MODIS Collection 6.1\MODIS Collection 6.1 Terra\MODIS Collection 6.1 Terra GPP\MODIS Collection 6.1 Terra GPP 500m 2013-2022\tile_data_new\'
+    cum_name = strcat(out_main,'Cum_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    cum_name = cell2mat(cum_name);
+    min_name = strcat(out_main,'Min_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    min_name = cell2mat(min_name);
+    var_name = strcat(out_main,'Var_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    var_name = cell2mat(var_name);
+    geotiffwrite(cum_name,scale_cum_data,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+    geotiffwrite(min_name,scale_min_data,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+    geotiffwrite(var_name,scale_var_data,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+
+end
