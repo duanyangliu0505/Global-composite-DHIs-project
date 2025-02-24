@@ -1,0 +1,679 @@
+/* 
+Objective: Generate the QA layers of MODSI MODIS Collection 6.1 Aqua EVI 500m 2013-2022 DHIs
+Authors: Duanyang Liu, Duda, Elena
+Date: 2023-02-02
+*/
+var StartDate = '2013-01-01';
+var EndDate= '2022-12-31';
+
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+  // Select the QA band.
+  var qa = image.select('DetailedQA')
+  var cloud=qa.bitwiseAnd(1 << 5);  // 0000, 0001, 0010, 0100 [2-5 bits]
+  // Return an image masking out cloudy areas.
+  return image.updateMask(cloud.not());
+}
+
+//A function to remove water.
+var maskWater = function(image) {
+  // Select the QA band.
+  var qa = image.select('DetailedQA')
+  // Make a mask to get bit 10, the internal_cloud_algorithm_flag bit.
+  var water=qa.bitwiseAnd(1 << 13) // 100,101,110,111 [11-13bits]
+            .or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(0 << 12)).and(qa.bitwiseAnd(0 << 11))) //000 [11-13bits] shallow ocean
+.or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(1 << 12)).and(qa.bitwiseAnd(1 << 11)));  // 011 [11-13 bits] shallow inland water
+  // Return an image masking out cloudy areas.
+  return image.updateMask(water.not());
+}
+
+//Select pixel with snow [bit 14]
+var Snow = function(image) {
+  var qa = image.select('DetailedQA');
+  var snowMask = qa.bitwiseAnd(1 << 14).rename('SnowMask');
+  return image.addBands(snowMask)
+}
+
+//Assign NDVI=0.0001 for pixels with snow/ice 
+var removesnow=function(image){
+  var snow = image.select('SnowMask');
+  var ndvitemp=image.select('EVI');
+  var snowzero= ndvitemp.where(snow.eq(16384),0)
+return snowzero
+}
+
+//Replace all negative NDVI by 0, because 0<NDVI<1 for vegetation
+var ndvipos=function(image){
+  var ndvitemp=image.select('EVI');
+  return image.where(ndvitemp.lt(0),0)  
+};
+
+var EVI_col= ee.ImageCollection('MODIS/061/MYD13A1')///MODIS/061/MYD13A1
+                  .filterDate(StartDate,EndDate)
+                  //.filterBounds(AOI)
+                  .map(maskClouds)
+                  .map(maskWater)
+                  .map(Snow)
+                  .map(removesnow) 
+                  .select('EVI')
+                  .map(ndvipos);
+Map.addLayer(EVI_col,{},'EVI_col');
+var EVIJan=EVI_col.first()
+//Map.addLayer(ndviJan,{},'January');
+
+//Select median value over the 11 years at each of the time steps of the MODIS product
+var date = ee.List([9, 25, 41, 57,73, 89, 105, 121, 137,  153,
+169, 185, 201, 217, 233, 249, 265, 281, 297, 313, 329, 345, 361]);
+var byDate = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var EVI_median = EVI_col
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return EVI_median
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+print(byDate, 'byDate');
+
+//Calculate statistics for EVI                
+var EVI_stats = byDate.reduce(ee.Reducer.min())
+    .addBands(byDate.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate.reduce(ee.Reducer.sum()))
+    .addBands(byDate.reduce(ee.Reducer.mean()))
+    .addBands(byDate.reduce(ee.Reducer.count())); 
+
+//the DHIs
+var CumDHI=EVI_stats.select(2).rename('DHI_cum')
+//Map.addLayer (CumDHI, { }, 'CumDHI');
+
+var MinDHI=EVI_stats.select(0).rename('DHI_min')
+//Map.addLayer (MinDHI, {}, 'MinDHI');
+
+var VarDHI=EVI_stats.select(1).divide(EVI_stats.select(3)).rename('DHI_var')
+//Map.addLayer(VarDHI, {},'VarDHI');
+
+// mask water body by using MOD44W product
+var dataset = ee.ImageCollection('MODIS/006/MOD44W')
+                 .filter(ee.Filter.date('2015-01-01', '2015-05-01'));
+var waterMask = dataset.select('water_mask');
+var waterMaskVis = {
+  min: 0.0,
+  max: 1.0,
+  palette: ['bcba99', '2d0491'],
+};
+//Map.setCenter(6.746, 46.529, 2);
+//Map.addLayer(waterMask, waterMaskVis, 'Water Mask');
+
+var apllymask = waterMask.reduce(ee.Reducer.mean()).lt(1)
+var CumDHI_mask6=CumDHI.updateMask(apllymask).float();
+var MinDHI_mask6=MinDHI.updateMask(apllymask).float();
+var VarDHI_mask6=VarDHI.updateMask(apllymask).float();
+
+// Cum and Min DHIs scaled to [0, 100]
+var CumDHI6_scaled = CumDHI_mask6.divide(10000).divide(23).multiply(100)
+//var CumDHI_VIIRS_scaled = CumDHI_maskV.divide(10000).divide(23).multiply(100)
+var MinDHI6_scaled = MinDHI_mask6.divide(10000).divide(1).multiply(100)
+//var MinDHI_VIIRS_scaled = MinDHI_maskV.divide(10000).divide(1).multiply(100)
+var VarDHI6_scaled = VarDHI_mask6
+//var VarDHI_VIIRS_scaled = VarDHI_maskV.divide(10)
+
+//******************************quality flags calculation****************************************
+var initial_observation_evi = ee.ImageCollection("MODIS/061/MYD13A1")
+                  .filterDate(StartDate,EndDate)
+                  .select('EVI');
+Map.addLayer(initial_observation_evi, {}, 'initial_observation_evi')
+var initial_byDate = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var EVI_median = initial_observation_evi
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .count();
+    return EVI_median
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+Map.addLayer(initial_byDate, {}, 'initial_byDate')
+var initial_count_observation = initial_byDate.toBands();    
+var initial_sum_count_observation = initial_count_observation.reduce(ee.Reducer.sum())
+Map.addLayer(initial_sum_count_observation, {}, 'initial_sum_count_observation')
+var initial_observation = ee.ImageCollection("MODIS/061/MYD13A1")
+                  .filterDate(StartDate,EndDate);
+
+var land_cover = ee.ImageCollection('MODIS/061/MCD12Q1')
+                  .filterDate('2015-01-01', '2015-05-01')
+                  .select('LC_Type1');
+var land_cover = land_cover.toBands()
+Map.addLayer(land_cover, {}, 'land_cover')
+
+//firstly, count the fraction of observation with good quality
+
+var good_quality_detect = function(image)
+{
+  var qa = image.select('DetailedQA');
+  var good_quality = qa.bitwiseAnd(1 << 0).or(qa.bitwiseAnd(1<<1))//.and(qa.bitwiseAnd(0 << 1));
+  return good_quality
+}
+var good_quality_observation = initial_observation.map(good_quality_detect)
+//Map.addLayer(good_quality_observation, {}, 'good_quality_observation')
+var sum_good_quality = good_quality_observation.reduce(ee.Reducer.sum()).divide(1).divide(230).multiply(100)
+var sum_good_quality = sum_good_quality.divide(-1).add(100)
+var water_sum_good_quality=sum_good_quality.updateMask(apllymask).float();
+var water_sum_good_quality = water_sum_good_quality.where(land_cover.eq(17),0) 
+Map.addLayer(water_sum_good_quality, {}, 'water_sum_good_quality')
+
+//secondly,count the number/fraction of missing data by cloud or unavailable in GEE??? 
+var date = ee.List([9, 25, 41, 57,73, 89, 105, 121, 137,  153,
+169, 185, 201, 217, 233, 249, 265, 281, 297, 313, 329, 345, 361]);
+var byDate_QA = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var EVI_median = EVI_col
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .count();
+    return EVI_median
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+
+var count_observation = byDate_QA.toBands();
+var sum_count_observation = count_observation.reduce(ee.Reducer.sum()).divide(230).multiply(100)
+//Map.addLayer(sum_count_observation, {}, 'sum_count_observation')
+
+var water_sum_count_observation=sum_count_observation.updateMask(apllymask).float();
+var water_sum_count_observation = water_sum_count_observation.where(land_cover.eq(17),0)  
+Map.addLayer(water_sum_count_observation, {}, 'water_sum_count_observation')
+
+//thirdly, count the fraction of snow masked observations
+var snow_mask_detect = function(image)
+{
+  var qa = image.select('DetailedQA');
+  var snow = qa.bitwiseAnd(1<<14);
+  return snow
+}
+var snow_observation = initial_observation.map(snow_mask_detect)
+//Map.addLayer(snow_observation, {}, 'snow_observation')
+var sum_snow_observation = snow_observation.sum().divide(16384).divide(initial_sum_count_observation).multiply(100)
+//Map.addLayer(sum_snow_observation, {}, 'sum_snow_observation')
+var water_sum_snow_observation = sum_snow_observation.updateMask(apllymask).float();
+var water_sum_snow_observation = water_sum_snow_observation.where(land_cover.eq(17),0) 
+Map.addLayer(water_sum_snow_observation, {}, 'water_sum_snow_observation')
+
+//fourthly, count the fraction of cloud masked observations
+
+var cloud_mask_datect = function(image)
+{
+  var qa = image.select('DetailedQA');
+  var cloud = qa.bitwiseAnd(1<<5); //0000, 0001, 0010, 0100 [2-5 bits]
+  return cloud
+}
+
+var cloud_observation = initial_observation.map(cloud_mask_datect)
+Map.addLayer(cloud_observation, {}, 'cloud_observation')
+var sum_cloud_observation = cloud_observation.sum().divide(32).divide(initial_sum_count_observation).multiply(100)
+//Map.addLayer(sum_cloud_observation, {}, 'sum_cloud_observation')
+var water_sum_cloud_observation = sum_cloud_observation.updateMask(apllymask).float();
+var water_sum_snow_observation = water_sum_snow_observation.where(water_sum_snow_observation.gt(100),100) 
+var water_sum_snow_observation = water_sum_snow_observation.where(land_cover.eq(17),0) 
+Map.addLayer(water_sum_cloud_observation, {}, 'water_sum_cloud_observation')
+
+//finally, calculate the composite layer
+var composite_good_quality = water_sum_good_quality.where(water_sum_good_quality.lt(20),1);
+var composite_good_quality = composite_good_quality.where(composite_good_quality.lt(40).and(composite_good_quality.gte(20)),2);
+var composite_good_quality = composite_good_quality.where(composite_good_quality.lt(60).and(composite_good_quality.gte(40)),3);
+var composite_good_quality = composite_good_quality.where(composite_good_quality.lt(80).and(composite_good_quality.gte(60)),4);
+var composite_good_quality = composite_good_quality.where(composite_good_quality.gte(80),5);
+//Map.addLayer(composite_good_quality, {}, 'composite_good_quality')
+
+var composite_observation = water_sum_count_observation.where(water_sum_count_observation.lt(20),1);
+var composite_observation = composite_observation.where(composite_observation.lt(40).and(composite_observation.gte(20)),2);
+var composite_observation = composite_observation.where(composite_observation.lt(60).and(composite_observation.gte(40)),3);
+var composite_observation = composite_observation.where(composite_observation.lt(80).and(composite_observation.gte(60)),4);
+var composite_observation = composite_observation.where(composite_observation.gte(80),5);
+//Map.addLayer(composite_observation, {}, 'composite_observation')
+
+var composite_snow = water_sum_snow_observation.where(water_sum_snow_observation.lt(20),5);
+var composite_snow = composite_snow.where(composite_snow.lt(40).and(composite_snow.gte(20)),4);
+var composite_snow = composite_snow.where(composite_snow.lt(60).and(composite_snow.gte(40)),3);
+var composite_snow = composite_snow.where(composite_snow.lt(80).and(composite_snow.gte(60)),2);
+var composite_snow = composite_snow.where(composite_snow.gte(80),1);
+//Map.addLayer(composite_snow, {}, 'composite_snow')
+
+var composite_cloud = water_sum_cloud_observation.where(water_sum_cloud_observation.lt(20),5);
+var composite_cloud = composite_cloud.where(composite_cloud.lt(40).and(composite_cloud.gte(20)),4);
+var composite_cloud = composite_cloud.where(composite_cloud.lt(60).and(composite_cloud.gte(40)),3);
+var composite_cloud = composite_cloud.where(composite_cloud.lt(80).and(composite_cloud.gte(60)),2);
+var composite_cloud = composite_cloud.where(composite_cloud.gte(80),1);
+//Map.addLayer(composite_cloud, {}, 'composite_cloud')
+
+var composite_layer = composite_good_quality.add(composite_observation).add(composite_snow).add(composite_cloud)
+var composite_layer = composite_layer.int8();
+var composite_layer = composite_layer.where(land_cover.eq(17),0)
+Map.addLayer(composite_layer, {}, 'composite_layer')
+
+
+var geometry1 = ee.Geometry.Rectangle([-180, -90, -135, 90]);
+var geometry2 = ee.Geometry.Rectangle([-135, -90, -90, 90]);
+var geometry3 = ee.Geometry.Rectangle([-90, -90, -45, 90]);
+var geometry4 = ee.Geometry.Rectangle([-45, -90, 0, 90]);
+var geometry5 = ee.Geometry.Rectangle([0, -90, 45, 90]);
+var geometry6 = ee.Geometry.Rectangle([45, -90, 90, 90]);
+var geometry7 = ee.Geometry.Rectangle([90, -90, 135, 90]);
+var geometry8 = ee.Geometry.Rectangle([135, -90, 180, 90]);
+print('Projection, crs, and crs_transform:',water_sum_good_quality.projection());
+//var project_water_sum_good_quality = water_sum_good_quality.changeProj('SR-ORG:6974','EPSG:4326')
+//Map.addLayer(project_water_sum_good_quality, {}, 'project_water_sum_good_quality')
+
+// part 1
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: '11_good_quality_MODIS_Aqua_EVI_500m_part1_2013-2022',
+ scale: 500,
+ region: geometry1,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part1_2013-2022',
+   scale: 500,
+   region: geometry1,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part1_2013-2022',
+   scale: 500,
+   region: geometry1,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part1_2013-2022',
+   scale: 500,
+   region: geometry1,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 2
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: '11_good_quality_MODIS_Aqua_EVI_500m_part2_2013-2022',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part2_2013-2022',
+   scale: 500,
+   region: geometry2,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part2_2013-2022',
+   scale: 500,
+   region: geometry2,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part2_2013-2022',
+   scale: 500,
+   region: geometry2,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 3
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: '1_good_quality_MODIS_Aqua_EVI_500m_part3_2013-2022',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part3_2013-2022',
+   scale: 500,
+   region: geometry3,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part3_2013-2022',
+   scale: 500,
+   region: geometry3,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part3_2013-2022',
+   scale: 500,
+   region: geometry3,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 4
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: 'new_sum_good_quality_MODIS_Aqua_EVI_500m_part4_2013-2022',
+ scale: 500,
+ region: geometry4,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part4_2013-2022',
+   scale: 500,
+   region: geometry4,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part4_2013-2022',
+   scale: 500,
+   region: geometry4,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part4_2013-2022',
+   scale: 500,
+   region: geometry4,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 5
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: 'new_sum_good_quality_MODIS_Aqua_EVI_500m_part5_2013-2022',
+ scale: 500,
+ region: geometry5,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part5_2013-2022',
+   scale: 500,
+   region: geometry5,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part5_2013-2022',
+   scale: 500,
+   region: geometry5,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part5_2013-2022',
+   scale: 500,
+   region: geometry5,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 6
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: 'new_sum_good_quality_MODIS_Aqua_EVI_500m_part6_2013-2022',
+ scale: 500,
+ region: geometry6,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part6_2013-2022',
+   scale: 500,
+   region: geometry6,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part6_2013-2022',
+   scale: 500,
+   region: geometry6,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part6_2013-2022',
+   scale: 500,
+   region: geometry6,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 7
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: 'new_sum_good_quality_MODIS_Aqua_EVI_500m_part7_2013-2022',
+ scale: 500,
+ region: geometry7,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part7_2013-2022',
+   scale: 500,
+   region: geometry7,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'sum_snow_observation_MODIS_Aqua_EVI_500m_part7_2013-2022',
+   scale: 500,
+   region: geometry7,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'sum_cloud_observation_MODIS_Aqua_EVI_500m_part7_2013-2022',
+   scale: 500,
+   region: geometry7,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+// part 8
+Export.image.toDrive({
+ image:water_sum_good_quality,
+ description: 'new_sum_good_quality_MODIS_Aqua_EVI_500m_part8_2013-2022',
+ scale: 500,
+ region: geometry8,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_count_observation,
+   description: 'new_sum_count_observation_MODIS_Aqua_EVI_500m_part8_2013-2022',
+   scale: 500,
+   region: geometry8,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:water_sum_snow_observation,
+   description: 'water_sum_snow_observation_MODIS_Aqua_EVI_500m_part8_2013-2022',
+   scale: 500,
+   region: geometry8,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+ 
+  Export.image.toDrive({
+   image:water_sum_cloud_observation,
+   description: 'water_sum_cloud_observation_MODIS_Aqua_EVI_500m_part8_2013-2022',
+   scale: 500,
+   region: geometry8,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
+
+ 
+ Export.image.toDrive({
+ image:composite_layer,
+ description: 'composite_layer_MODIS_Aqua_EVI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ //crs: "EPSG:4326", 
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13
+});
