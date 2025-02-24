@@ -1,0 +1,779 @@
+// Calculate the uncertainty of DHIs (MODIS Aqua C61 EVI)
+// Author: Duanyang Liu
+// Date:2024-11-24
+// ATBD for MODIS NDVI and LAI
+var StartDate = '2013-01-01';
+var EndDate= '2022-12-31';
+
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+  // Select the QA band.
+  var qa = image.select('DetailedQA')
+  var cloud=qa.bitwiseAnd(1 << 5);  // 0000, 0001, 0010, 0100 [2-5 bits]
+  // Return an image masking out cloudy areas.
+  return image.updateMask(cloud.not());
+}
+
+//A function to remove water.
+var maskWater = function(image) {
+  // Select the QA band.
+  var qa = image.select('DetailedQA')
+  // Make a mask to get bit 10, the internal_cloud_algorithm_flag bit.
+  var water=qa.bitwiseAnd(1 << 13) // 100,101,110,111 [11-13bits]
+            .or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(0 << 12)).and(qa.bitwiseAnd(0 << 11))) //000 [11-13bits] shallow ocean
+.or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(1 << 12)).and(qa.bitwiseAnd(1 << 11)));  // 011 [11-13 bits] shallow inland water
+  // Return an image masking out cloudy areas.
+  return image.updateMask(water.not());
+}
+
+//Select pixel with snow [bit 14]
+var Snow = function(image) {
+  var qa = image.select('DetailedQA');
+  var snowMask = qa.bitwiseAnd(1 << 14).rename('SnowMask');
+  return image.addBands(snowMask)
+}
+
+//Assign NDVI=0.0001 for pixels with snow/ice 
+var removesnow=function(image){
+  var snow = image.select('SnowMask');
+  var ndvitemp=image.select('EVI');
+  var snowzero= ndvitemp.where(snow.eq(16384),0)
+return snowzero
+}
+
+//Replace all negative NDVI by 0, because 0<NDVI<1 for vegetation
+var ndvipos=function(image){
+  var ndvitemp=image.select('EVI');
+  return image.where(ndvitemp.lt(0),0)  
+};
+
+
+var EVI_col= ee.ImageCollection('MODIS/061/MYD13A1')
+                  .filterDate(StartDate,EndDate)
+                  //.filterBounds(AOI)
+                  .map(maskClouds)
+                  .map(maskWater)
+                  .map(Snow)
+                  .map(removesnow) 
+                  .select('EVI')
+                  .map(ndvipos);
+Map.addLayer (EVI_col, { }, 'EVI_col');
+
+
+//**************************************calculate the upper and lower DHIs**************************************
+//calculate the upper and lower NDVI based on ATBD
+var landcover = ee.ImageCollection('MODIS/061/MCD12Q1')
+              .select('LC_Type1')
+              .filterDate('2008-01-01','2008-12-31');
+var landcover = landcover.first();
+//create the raw 'std image' and filled with 0 value
+var std = landcover;
+var std = std.where(std.gt(0),0);
+Map.addLayer (landcover, { }, 'landcover');
+
+//fill the 'std image' based on land type
+var std = std.where(landcover.eq(1),0.03);
+var std = std.where(landcover.eq(2),0.037);
+var std = std.where(landcover.eq(3),0.029);
+var std = std.where(landcover.eq(4),0.059);
+var std = std.where(landcover.eq(5),0.028);
+var std = std.where(landcover.eq(6),0.026);
+var std = std.where(landcover.eq(7),0.008);
+var std = std.where(landcover.eq(8),0.035);
+var std = std.where(landcover.eq(9),0.009);
+var std = std.where(landcover.eq(10),0.028);
+var std = std.where(landcover.eq(12),0.094);
+var std = std.where(landcover.eq(13),0.01);
+var std = std.where(landcover.eq(15),0.027);
+var std = std.where(landcover.eq(16),0.01);
+Map.addLayer (std, { }, 'std');
+
+function upper_evi(image) {
+  //scale the raw NDVI data to [0,1]
+  var evi = image.select('EVI').divide(10000);
+  var evi_upper = evi.add(std.multiply(1.96));
+  return evi_upper.copyProperties(image, ['system:time_start'])
+}
+
+var upper_evi_data = EVI_col.map(upper_evi)
+Map.addLayer(upper_evi_data,{},'upper_evi_data');
+
+function lower_evi(image) {
+  //scale the raw NDVI data to [0,1]
+  var evi = image.select('EVI').divide(10000);
+  var evi_lower = evi.subtract(std.multiply(1.96))
+  return evi_lower.copyProperties(image, ['system:time_start'])
+}
+
+var lower_evi_data = EVI_col.map(lower_evi)
+Map.addLayer(lower_evi_data,{},'lower_evi_data');
+
+// mask water body by using MOD44W product
+var dataset = ee.ImageCollection('MODIS/006/MOD44W')
+                 .filter(ee.Filter.date('2015-01-01', '2015-05-01'));
+var waterMask = dataset.select('water_mask');
+var waterMaskVis = {
+  min: 0.0,
+  max: 1.0,
+  palette: ['bcba99', '2d0491'],
+};
+var apllymask = waterMask.reduce(ee.Reducer.mean()).lt(1)
+
+var date = ee.List([9, 25, 41, 57,73, 89, 105, 121, 137,  153,
+169, 185, 201, 217, 233, 249, 265, 281, 297, 313, 329, 345, 361]);
+
+//calculate the upper DHIs
+var byDate_upper = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var EVI_upper = upper_evi_data
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return EVI_upper
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+Map.addLayer (byDate_upper, { }, 'byDate_upper');
+var EVI_stats_upper = byDate_upper.reduce(ee.Reducer.min())
+    .addBands(byDate_upper.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate_upper.reduce(ee.Reducer.sum()))
+    .addBands(byDate_upper.reduce(ee.Reducer.mean()))
+    .addBands(byDate_upper.reduce(ee.Reducer.count())); 
+
+//the DHIs
+var CumDHI_upper = EVI_stats_upper.select(2)
+print(CumDHI_upper)
+//Map.addLayer (CumDHI_upper, { }, 'CumDHI_upper');
+var MinDHI_upper = EVI_stats_upper.select(0).rename('DHI_min')
+//Map.addLayer (MinDHI_upper, {}, 'MinDHI_upper');
+var VarDHI_upper = EVI_stats_upper.select(1).divide(EVI_stats_upper.select(3)).rename('DHI_var')
+//Map.addLayer(VarDHI_upper, {},'VarDHI_upper');
+
+var CumDHI_upper_mask6 = CumDHI_upper.updateMask(apllymask).float();
+var MinDHI_upper_mask6 = MinDHI_upper.updateMask(apllymask).float();
+var VarDHI_upper_mask6 = VarDHI_upper.updateMask(apllymask).float();
+
+
+// Cum and Min DHIs scaled to [0, 100]
+var CumDHI6_upper_scaled = CumDHI_upper_mask6.divide(23).multiply(100)
+Map.addLayer(CumDHI6_upper_scaled, {},'CumDHI6_upper_scaled');
+var MinDHI6_upper_scaled = MinDHI_upper_mask6.divide(1).multiply(100)
+Map.addLayer(MinDHI6_upper_scaled, {},'MinDHI6_upper_scaled');
+var VarDHI6_upper_scaled = VarDHI_upper
+Map.addLayer(VarDHI6_upper_scaled, {},'VarDHI6_upper_scaled');
+
+
+//calculate the lower DHIs
+var byDate_lower = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var EVI_lower = lower_evi_data
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return EVI_lower
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+
+var EVI_stats_lower = byDate_lower.reduce(ee.Reducer.min())
+    .addBands(byDate_lower.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate_lower.reduce(ee.Reducer.sum()))
+    .addBands(byDate_lower.reduce(ee.Reducer.mean()))
+    .addBands(byDate_lower.reduce(ee.Reducer.count())); 
+
+//the DHIs
+var CumDHI_lower = EVI_stats_lower.select(2).rename('DHI_cum')
+var MinDHI_lower = EVI_stats_lower.select(0).rename('DHI_min')
+//Map.addLayer (MinDHI_upper, {}, 'MinDHI_upper');
+var VarDHI_lower = EVI_stats_lower.select(1).divide(EVI_stats_lower.select(3)).rename('DHI_var')
+//Map.addLayer(VarDHI_upper, {},'VarDHI_upper');
+
+var CumDHI_lower_mask6 = CumDHI_lower.updateMask(apllymask).float();
+var MinDHI_lower_mask6 = MinDHI_lower.updateMask(apllymask).float();
+var VarDHI_lower_mask6 = VarDHI_lower.updateMask(apllymask).float();
+
+// Cum and Min DHIs scaled to [0, 100]
+var CumDHI6_lower_scaled = CumDHI_lower_mask6.divide(23).multiply(100)
+Map.addLayer(CumDHI6_lower_scaled, {},'CumDHI6_lower_scaled');
+var MinDHI6_lower_scaled = MinDHI_lower_mask6.divide(1).multiply(100)
+Map.addLayer(MinDHI6_lower_scaled, {},'MinDHI6_lower_scaled');
+var VarDHI6_lower_scaled = VarDHI_lower
+Map.addLayer(VarDHI6_lower_scaled, {},'VarDHI6_lower_scaled');
+
+
+
+var geometry1 = ee.Geometry.Rectangle([-180, -90, -135, 90]);
+var geometry2 = ee.Geometry.Rectangle([-135, -90, -90, 90]);
+var geometry3 = ee.Geometry.Rectangle([-90, -90, -45, 90]);
+var geometry4 = ee.Geometry.Rectangle([-45, -90, 0, 90]);
+var geometry5 = ee.Geometry.Rectangle([0, -90, 45, 90]);
+var geometry6 = ee.Geometry.Rectangle([45, -90, 90, 90]);
+var geometry7 = ee.Geometry.Rectangle([90, -90, 135, 90]);
+var geometry8 = ee.Geometry.Rectangle([135, -90, 180, 90]);
+
+var upper_CumDHI = CumDHI6_upper_scaled
+var upper_MinDHI = MinDHI6_upper_scaled
+var upper_VarDHI = VarDHI6_upper_scaled
+
+var lower_CumDHI = CumDHI6_lower_scaled
+var lower_MinDHI = MinDHI6_lower_scaled
+var lower_VarDHI = VarDHI6_lower_scaled
+
+var diff_cum = upper_CumDHI.subtract(lower_CumDHI)
+Map.addLayer(diff_cum, {},'diff_cum');
+var diff_min = upper_MinDHI.subtract(lower_MinDHI)
+Map.addLayer(diff_min, {},'diff_min');
+var diff_var = upper_VarDHI.subtract(lower_VarDHI)
+Map.addLayer(diff_var, {},'diff_var');
+
+
+
+//part 1
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13,
+ folder:'MODIS Aqua NDVI uncertainty',
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+ crs: "SR-ORG:6974", 
+ crsTransform: [463.3127165279165, 0.0, -2.0015109354E7, 0.0, -463.3127165279167, 1.0007554677003E7],
+ maxPixels:1e13,
+ folder:'MODIS Aqua NDVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 2
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 3
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 4
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 5
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 6
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 7
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//part 8
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Aqua_EVI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'MODIS Aqua EVI uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Aqua_EVI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Aqua_EVI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'MODIS Aqua EVI uncertainty'
+ });
