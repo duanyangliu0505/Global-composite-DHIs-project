@@ -1,0 +1,180 @@
+%This code is designed to calculate the QA maps of MODIS GPP (MOD17A2HGF)
+%composite DHIs from tile data
+%there are four QA layers in GPP based DHIs.
+%1: good quality, 2: available observation, 3: cloud-cover, 4: composite 
+%Author: Duanyang Liu
+%Date:2024-11-05
+
+%% step-1, import the tile names over global scale
+tile_names = importdata('global_tiles_new.xlsx');
+[tile_m, tile_n] = size(tile_names);
+main_path = 'Z:\VIIRS V2\VNP13A1A2\MOD17A2HGF_';
+
+%% step-2, load the VIs data from h5 files.
+%Durning this step, the cloud and snow covered data will be prcessed
+%And the data-loading and processing are conduct by tiles
+missing_tiles = [];
+
+for tile_num = 1:tile_m
+    tile_str = tile_names(tile_num,:);
+    year_median = [];
+    count = 0;
+    available_tile_count = zeros(2400,2400);   %count the available tile numbser, one-dimensional
+    good_quality_count = zeros(2400,2400);    %count the good quality numbser, two-dimensional
+    cloud_count = zeros(2400,2400);
+
+    for doy = 1:8:361 
+        count = count + 1; 
+        doy;
+        if doy<10
+            doy_str = strcat('00', string(doy));
+        else
+            if doy<100
+                doy_str = strcat('0', string(doy));
+            else
+                doy_str = string(doy);
+            end
+        end
+        %For each tile on each doy date, loading the ten years data 
+        %and select the median value
+        doy_data = [];        
+        for year = 2013:2022            
+            year_str = string(year);
+            %creat the keyword of target file path
+            file_key = strcat('MOD17A2HGF.A',year_str,doy_str,'*',tile_str,'*.hdf');
+            file_path_key = strcat(main_path,year_str,'\',file_key)
+            target_file = dir(file_path_key);
+            if isempty(target_file)
+                missing_feature = strcat(tile_str,'_',doy_str,'_',year_str);
+                %print the missing tile and observation date
+                missing_tiles = [missing_tiles; missing_feature]
+                pro_vi_data = zeros(2400,2400)*NaN;
+                doy_data = [doy_data,pro_vi_data(:)];
+                %missing_number = missing_number + 1;
+                good_quality_count = good_quality_count + ones(2400,2400);
+                cloud_count = cloud_count + ones(2400,2400);
+
+                continue
+            else
+                tile_data = zeros(2400,2400);
+                %available_tile_count = available_tile_count + 1;
+                target_file_path = strcat(main_path,year_str,'\',target_file(1).name);
+                %read the GPP data
+                vi_data = hdfread(target_file_path,'Gpp_500m');
+                %read the corresponding QA data
+                qa_data = hdfread(target_file_path,'/Psn_QC_500m');
+                pro_vi_data = double(vi_data);
+                %valid rang 0 - 30000, scale factor 0.0001                
+                pro_vi_data(pro_vi_data<0) = 0;
+                pro_vi_data(pro_vi_data>30000) = NaN;
+                %convert the qa data to binary, with consistent length 8
+                qa_data_binary = dec2bin(qa_data,8);
+                %the scale factor is 0.0001
+                pro_vi_data = double(vi_data)./10000;
+
+                %for snow/ice covered data, set as 0
+                %snow_index = qa_data_binary(:,7);
+                %snow_index = double(snow_index) - double('0');
+                %snow_index = reshape(snow_index,2400,2400);
+                %pro_vi_data(snow_index == 1) = 0;
+                %for cloud covered data, set as NaN
+                %% count the good quality observation
+                good_quality_index = qa_data_binary(:,8);
+                %only '0' is Good quality observation
+                good_quality_index = double(good_quality_index) - double('0');
+                good_quality_index = reshape(good_quality_index,2400,2400);
+                good_quality_count = good_quality_count + good_quality_index;
+
+                cloud_index = qa_data_binary(:,4:5);
+                %only '00' is clear pixel (no cloud)
+                cloud_index = double(cloud_index) - double('00');
+                cloud_index = sum(cloud_index,2);
+                cloud_index(cloud_index>0) = 1;
+                cloud_index = reshape(cloud_index,2400,2400);
+                cloud_count = cloud_count + cloud_index;
+                %pro_vi_data(cloud_index > 0) = NaN;
+                doy_data = [doy_data,pro_vi_data(:)];
+                tile_data(pro_vi_data<1 & pro_vi_data>0) = 1;
+                tile_data(cloud_index>0) = 0;
+                available_tile_count = available_tile_count + tile_data;
+            end           
+        end
+    end 
+
+    %% step-3, calculate the relative value of three QA layers
+    good_quality_layer_number = ones(2400,2400).*460 - good_quality_count;
+    good_quality_layer_relative = good_quality_layer_number./460.*100;
+    
+    %available_tile_relative = ones(2400,2400).*(available_tile_count/460).*100;
+    available_tile_relative = (available_tile_count/460).*100;
+    
+    cloud_count_relative = cloud_count./460.*100;
+    
+    %% step-4, proprocess for the composite QA layer
+    layer_good_quality_layer_relative = zeros(2400,2400);
+    layer_good_quality_layer_relative(good_quality_layer_relative>80 & good_quality_layer_relative<=100) = 5;
+    layer_good_quality_layer_relative(good_quality_layer_relative>60 & good_quality_layer_relative<=80) = 4;
+    layer_good_quality_layer_relative(good_quality_layer_relative>40 & good_quality_layer_relative<=60) = 3;
+    layer_good_quality_layer_relative(good_quality_layer_relative>20 & good_quality_layer_relative<=40) = 2;
+    layer_good_quality_layer_relative(good_quality_layer_relative>=0 & good_quality_layer_relative<=60) = 1;
+    
+    layer_available_tile_relative = zeros(2400,2400);
+    layer_available_tile_relative(available_tile_relative>80 & available_tile_relative<=100) = 5;
+    layer_available_tile_relative(available_tile_relative>60 & available_tile_relative<=80) = 4;
+    layer_available_tile_relative(available_tile_relative>40 & available_tile_relative<=60) = 3;
+    layer_available_tile_relative(available_tile_relative>20 & available_tile_relative<=40) = 2;
+    layer_available_tile_relative(available_tile_relative>=0 & available_tile_relative<=20) = 1;
+    
+    layer_cloud_count_relative = zeros(2400,2400);
+    layer_cloud_count_relative(cloud_count_relative>80 & cloud_count_relative<=100) = 1;
+    layer_cloud_count_relative(cloud_count_relative>60 & cloud_count_relative<=80) = 2;
+    layer_cloud_count_relative(cloud_count_relative>40 & cloud_count_relative<=60) = 3;
+    layer_cloud_count_relative(cloud_count_relative>20 & cloud_count_relative<=40) = 4;
+    layer_cloud_count_relative(cloud_count_relative>=0 & cloud_count_relative<=20) = 5;
+    layer_composite = layer_good_quality_layer_relative + layer_available_tile_relative + layer_cloud_count_relative;
+    %% step-5, mask the water body by MCD12Q1.061 product (Land Cover Type1,2018)
+    land_cover_main = 'Z:\VIIRS V2\VNP13A1A2\MCD12Q1\';
+    land_cover_key = strcat(land_cover_main,'*',tile_str,'*.hdf');
+    land_cover_key = cell2mat(land_cover_key);
+    land_cover_info = dir(land_cover_key);
+    if isempty(land_cover_info)
+        land_cover_data = ones(2400,2400);
+    else
+        land_cover_path = strcat(land_cover_main,land_cover_info.name);
+        land_cover_data = hdfread(land_cover_path,'LC_Type1');
+    end        
+    %mask the water body
+    good_quality_layer_relative(land_cover_data==17) =NaN;
+    available_tile_relative(land_cover_data==17) =NaN;
+    cloud_count_relative(land_cover_data==17) =NaN;
+    layer_composite(land_cover_data==17) =NaN;
+    
+    %mask the filled area
+    good_quality_layer_relative(pro_vi_data>3) = NaN;
+    available_tile_relative(pro_vi_data>3) =NaN;
+    cloud_count_relative(pro_vi_data>3) =NaN;
+    layer_composite(pro_vi_data>3) =NaN;
+    %% step-6, save the QA layer reuslts
+    tiff_main_path = 'Z:\VIIRS V2\VNP13A1A2\2015\tiff_2015\';
+    tiff_key = strcat(tiff_main_path,'*2015193.',tile_str,'*.tif');
+    tiff_key = cell2mat(tiff_key);
+    tiff_info = dir(tiff_key);
+    tiff_file_path = strcat(tiff_main_path,tiff_info.name);
+    [evi_data, R] = geotiffread(tiff_file_path);
+    info = geotiffinfo(tiff_file_path);
+    
+    out_main = 'V:\Duanyang\DuanyangLiu\PhD\global DHIs project\global DHIs\Global_DHIs_scaled\MODIS Collection 6.1\MODIS Collection 6.1 Terra\MODIS Collection 6.1 Terra GPP\MODIS Collection 6.1 Terra GPP 500m 2013-2022\new_QA\tile_data\'
+    good_quality_name = strcat(out_main,'good_quality_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    good_quality_name = cell2mat(good_quality_name);
+    available_name = strcat(out_main,'available_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    available_name = cell2mat(available_name);
+    cloud_name = strcat(out_main,'cloud_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    cloud_name = cell2mat(cloud_name);
+    composite_name = strcat(out_main,'composite_',tile_str,'_MODIS_Terra_GPP_2013_2022.tif');
+    composite_name = cell2mat(composite_name);
+    
+    geotiffwrite(good_quality_name,good_quality_layer_relative,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+    geotiffwrite(available_name,available_tile_relative,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+    geotiffwrite(cloud_name,cloud_count_relative,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+    geotiffwrite(composite_name,layer_composite,R,'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+end
