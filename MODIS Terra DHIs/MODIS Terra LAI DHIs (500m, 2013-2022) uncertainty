@@ -1,0 +1,1398 @@
+// Calculate the uncertainty of DHIs (MODIS Terra C61 LAI)
+// Author: Duanyang Liu
+// Date:2024-03-26
+
+var StartDate = '2013-01-01';
+var EndDate= '2022-12-31';
+//
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+  // Select the QA band.
+  var qa = image.select('FparLai_QC')
+  var cloud=qa.bitwiseAnd(1 << 3).and(qa.bitwiseAnd(0 << 4))     // significant cloud  [01] [3-4 bits]
+            .or(qa.bitwiseAnd(1 << 4).and(qa.bitwiseAnd(0 << 3)));  // mixed cloud  [10] [3-4 bits]
+  // Return an image masking out cloudy areas.
+  return image.updateMask(cloud.not());
+}
+
+//A function to remove water.
+var maskWater = function(image) {
+  // Select the QA band.
+  var qa = image.select('FparExtra_QC')
+  // Make a mask to get bit 10, the internal_cloud_algorithm_flag bit.
+      var water=qa.bitwiseAnd(1 << 1).and(qa.bitwiseAnd(0 << 0))
+      .or(qa.bitwiseAnd(1 << 1).and(qa.bitwiseAnd(0 << 1)));
+  //var water=qa.bitwiseAnd(1 << 13) // 100,101,110,111 [11-13bits]
+  //          .or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(0 << 12)).and(qa.bitwiseAnd(0 << 11))) //000 [11-13bits] shallow ocean
+//.or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(1 << 12)).and(qa.bitwiseAnd(1 << 11)));  // 011 [11-13 bits] shallow inland water
+  // Return an image masking out cloudy areas.
+  return image.updateMask(water.not());
+}
+
+// select pixel with success main (RT) method
+var scfmask = function (image){
+  var qa = image.select('FparLai_QC')
+  var scf_qc = qa.bitwiseAnd(1<<6).or(qa.bitwiseAnd(1<<7));
+  return image.updateMask(scf_qc.not());
+}
+
+//Select pixel with snow [bit 2]
+var Snow = function(image) {
+  var qa = image.select('FparExtra_QC');
+  var snowMask = qa.bitwiseAnd(1 << 2).rename('SnowMask');
+  return image.addBands(snowMask)
+}
+
+//Assign NDVI=0.0001 for pixels with snow/ice 
+var removesnow=function(image){
+  var snow = image.select('SnowMask');
+  var ndvitemp=image.select('Lai_500m');
+  var snowzero= ndvitemp.where(ndvitemp.eq(0.0001),0)
+return snowzero
+}
+
+//Replace all negative NDVI by 0, because 0<NDVI<1 for vegetation
+var ndvipos = function(image){
+  var ndvitemp=image.select('Lai_500m');
+  return image.where(ndvitemp.lt(0),0)  
+};
+
+//*****************************************functions to refine the upper and lower LAI*****************************************
+
+//Assign NDVI=0.0001 for pixels with snow/ice 
+var removesnow_upper_lower = function(image){
+  var snow = image.select('SnowMask');
+  var ndvitemp=image.select('Lai_500m_1');
+  var snowzero= ndvitemp.where(ndvitemp.eq(0.0001),0)
+return snowzero
+}
+
+//Replace all negative NDVI by 0, because 0<NDVI<1 for vegetation
+var ndvipos_upper_lower = function(image){
+  var ndvitemp=image.select('Lai_500m_1');
+  return image.where(ndvitemp.lt(0),0)  
+};
+
+var fPAR_col= ee.ImageCollection('MODIS/061/MOD15A2H')
+                  .filterDate(StartDate,EndDate)
+                  //.filterBounds(AOI)
+                  .map(maskClouds)
+                  .map(maskWater)
+                  .map(scfmask)
+                  .map(Snow)
+                  .map(removesnow) 
+                  .select('Lai_500m')
+                  .map(ndvipos);
+
+//Map.addLayer(fPAR_col,{},'fPAR_col');
+
+function add_upper_lai(image) {
+  var lai = image.select('Lai_500m')
+  var lai = lai.where(lai.lt(0),0)                      //set the negative value as 0                    
+  var lai = lai.where(lai.gt(254),0)                     //set the snow covered(filled as 255) as 0
+  var lai = lai.multiply(0.1)                           //the orginal LAI are up scaled 10 times, so we need tomultiply 0.1 first
+  var std = image.select('LaiStdDev_500m')
+  var std = std.where(std.gt(254),0)                    //set the filled STD value as 0
+  var std = std.multiply(0.1)                           //the orginal STD are up scaled 10 times, so we need tomultiply 0.1 first
+  //var lai_upper = lai.add(std.multiply(1.96).multiply(0.1)) ;
+ // var lai_data = fPAR_col.select('Lai_500m')
+  var lai_upper = lai.add(std.multiply(1.96)) ;
+  return image.addBands(lai_upper)
+}
+
+function add_lower_lai(image) {
+  var lai = image.select('Lai_500m')
+  var lai = lai.where(lai.lt(0),0)
+  var lai = lai.where(lai.gt(254),0)
+  var lai = lai.multiply(0.1) 
+  var std = image.select('LaiStdDev_500m')
+  var std = std.where(std.gt(254),0)
+  var std = std.multiply(0.1)
+  //var lai_lower = lai.subtract(std.multiply(1.96).multiply(0.1)) ;
+  var lai_lower = lai.subtract(std.multiply(1.96)) ;
+  return image.addBands(lai_lower)
+}
+
+var lai_col = ee.ImageCollection('MODIS/061/MOD15A2H')
+              .filterDate(StartDate,EndDate);
+
+var upper_lai = lai_col.map(add_upper_lai)
+Map.addLayer(upper_lai,{},'upper_lai');
+
+var lower_lai = lai_col.map(add_lower_lai)
+Map.addLayer(lower_lai,{},'lower_lai');
+
+var refine_upper_lai = upper_lai.map(maskClouds)
+                        .map(maskWater)
+                        .map(scfmask)
+                        .map(Snow)
+                        .map(removesnow_upper_lower)
+                        .select('Lai_500m_1')
+                        .map(ndvipos_upper_lower);
+Map.addLayer(refine_upper_lai,{},'refine_upper_lai');
+
+var refine_lower_lai = lower_lai.map(maskClouds)
+                        .map(maskWater)
+                        .map(scfmask)
+                        .map(Snow)
+                        .map(removesnow_upper_lower)
+                        .select('Lai_500m_1')
+                        .map(ndvipos_upper_lower);
+Map.addLayer(refine_lower_lai,{},'refine_lower_lai');
+
+//var upper_lai_data = upper_lai.select('Lai_500m_1')
+//Map.addLayer(upper_lai_data,{},'upper_lai_data');
+//var lower_lai_data = lower_lai.select('Lai_500m_1')
+//Map.addLayer(lower_lai_data,{},'lower_lai_data');
+var date = ee.List([1, 9, 17, 25, 33, 41, 49, 57, 65,73, 
+                    81,89, 97,105, 113,121, 129,137, 145, 
+                    153, 161, 169, 177, 185, 193, 201, 209,
+                    217, 225, 233, 241, 249, 257, 265, 273,
+                    281, 289, 297, 305, 313, 321, 329, 337,
+                    345, 353, 361]);
+
+//*******************************calculate the orginal LAI based DHI*******************************
+var byDate = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var fPAR_median = fPAR_col
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return fPAR_median
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+
+//Calculate statistics for EVI                
+var fPAR_stats = byDate.reduce(ee.Reducer.min())
+    .addBands(byDate.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate.reduce(ee.Reducer.sum()))
+    .addBands(byDate.reduce(ee.Reducer.mean()))
+    .addBands(byDate.reduce(ee.Reducer.count())); 
+
+//the DHIs
+var CumDHI=fPAR_stats.select(2).rename('DHI_cum')
+Map.addLayer (CumDHI, { }, 'CumDHI');
+
+var MinDHI=fPAR_stats.select(0).rename('DHI_min')
+//Map.addLayer (MinDHI, {}, 'MinDHI');
+
+var stdDev = fPAR_stats.select(1)
+//Map.addLayer(stdDev, {},'stdDev');
+var VarDHI=fPAR_stats.select(1).divide(fPAR_stats.select(3)).rename('DHI_var')
+//Map.addLayer(VarDHI, {},'VarDHI');
+
+// mask water body by using MOD44W product
+var dataset = ee.ImageCollection('MODIS/006/MOD44W')
+                 .filter(ee.Filter.date('2015-01-01', '2015-05-01'));
+var waterMask = dataset.select('water_mask');
+var waterMaskVis = {
+  min: 0.0,
+  max: 1.0,
+  palette: ['bcba99', '2d0491'],
+};
+//Map.setCenter(6.746, 46.529, 2);
+//Map.addLayer(waterMask, waterMaskVis, 'Water Mask');
+
+var apllymask = waterMask.reduce(ee.Reducer.mean()).lt(1)
+var CumDHI_mask6=CumDHI.updateMask(apllymask).float();
+var MinDHI_mask6=MinDHI.updateMask(apllymask).float();
+var VarDHI_mask6=VarDHI.updateMask(apllymask).float();
+
+// Cum and Min DHIs scaled to [0, 100]
+var CumDHI6_scaled = CumDHI_mask6.divide(10).divide(460).multiply(100)
+//var CumDHI6_scaled = CumDHI_mask6.divide(10000).divide(23).multiply(100)
+//var CumDHI_VIIRS_scaled = CumDHI_maskV.divide(10000).divide(23).multiply(100)
+Map.addLayer (CumDHI6_scaled, { }, 'CumDHI6_scaled');
+var MinDHI6_scaled = MinDHI_mask6
+//var MinDHI6_scaled = MinDHI_mask6.divide(10000).divide(1).multiply(100)
+//var MinDHI_VIIRS_scaled = MinDHI_maskV.divide(10000).divide(1).multiply(100)
+Map.addLayer (MinDHI6_scaled, {}, 'MinDHI6_scaled');
+var VarDHI6_scaled = VarDHI_mask6.divide(1)
+//var VarDHI6_scaled = VarDHI_mask6.divide(10)
+//var VarDHI_VIIRS_scaled = VarDHI_maskV.divide(10)
+Map.addLayer(VarDHI6_scaled, {},'VarDHI6_scaled');
+
+
+//*******************************calculate the upper and lower Terra LAI based DHI*******************************
+var byDate_upper = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var lai_upper_median = refine_upper_lai
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return lai_upper_median
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+
+
+var byDate_lower = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var lai_lower_median = refine_lower_lai
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return lai_lower_median
+        .set('day_of_year', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+
+var lai_upper_stats = byDate_upper.reduce(ee.Reducer.min())
+    .addBands(byDate_upper.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate_upper.reduce(ee.Reducer.sum()))
+    .addBands(byDate_upper.reduce(ee.Reducer.mean()))
+    .addBands(byDate_upper.reduce(ee.Reducer.count()));
+
+var lai_lower_stats = byDate_lower.reduce(ee.Reducer.min())
+    .addBands(byDate_lower.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate_lower.reduce(ee.Reducer.sum()))
+    .addBands(byDate_lower.reduce(ee.Reducer.mean()))
+    .addBands(byDate_lower.reduce(ee.Reducer.count()));
+
+var upper_CumDHI = lai_upper_stats.select(2).rename('upper_DHI_cum')
+var upper_CumDHI = upper_CumDHI.divide(460).multiply(100) 
+Map.addLayer (upper_CumDHI, { }, 'upper_CumDHI');
+var upper_MinDHI = lai_upper_stats.select(0).rename('upper_DHI_min')
+var upper_MinDHI = upper_MinDHI.divide(10).multiply(100)
+Map.addLayer (upper_MinDHI, {}, 'upper_MinDHI');
+var upper_VarDHI = lai_upper_stats.select(1).divide(lai_upper_stats.select(3)).rename('upper_DHI_var')
+Map.addLayer(upper_VarDHI, {},'upper_VarDHI');
+
+https://code.earthengine.google.com/976adb20f151c5a1becc69a55b65ffe8?noload=1
+var lower_CumDHI = lai_lower_stats.select(2).rename('upper_DHI_cum')
+var lower_CumDHI = lower_CumDHI.divide(460).multiply(100) 
+Map.addLayer (lower_CumDHI, { }, 'lower_CumDHI');
+var lower_MinDHI = lai_lower_stats.select(0).rename('upper_DHI_min')
+var lower_MinDHI = lower_MinDHI.divide(10).multiply(100)
+Map.addLayer (lower_MinDHI, {}, 'lower_MinDHI');
+var lower_VarDHI = lai_lower_stats.select(1).divide(lai_lower_stats.select(3)).rename('lower_DHI_var')
+Map.addLayer(lower_VarDHI, {},'lower_VarDHI');
+
+
+//calculate the absolute difference DHIs between upper and lower
+var abs_Cum_diff = upper_CumDHI.subtract(lower_CumDHI)
+Map.addLayer(abs_Cum_diff, {},'abs_Cum_diff');
+var abs_Min_diff = upper_MinDHI.subtract(lower_MinDHI)
+Map.addLayer(abs_Min_diff, {},'abs_Min_diff');
+var abs_Var_diff = upper_VarDHI.subtract(lower_VarDHI)
+Map.addLayer(abs_Var_diff, {},'abs_Var_diff');
+
+//calculat the relative difference DHIs between upper and lower
+var relative_Cum_diff = abs_Cum_diff.divide(CumDHI6_scaled).multiply(50);
+Map.addLayer(relative_Cum_diff, {},'relative_Cum_diff');
+var relative_Min_diff = abs_Min_diff.divide(MinDHI6_scaled).multiply(50);
+Map.addLayer(relative_Min_diff, {},'relative_Min_diff');
+var relative_Var_diff = abs_Var_diff.divide(VarDHI6_scaled).multiply(50);
+Map.addLayer(relative_Var_diff, {},'relative_Var_diff');
+
+
+var geometry1 = ee.Geometry.Rectangle([-180, -90, -135, 90]);
+var geometry2 = ee.Geometry.Rectangle([-135, -90, -90, 90]);
+var geometry3 = ee.Geometry.Rectangle([-90, -90, -45, 90]);
+var geometry4 = ee.Geometry.Rectangle([-45, -90, 0, 90]);
+var geometry5 = ee.Geometry.Rectangle([0, -90, 45, 90]);
+var geometry6 = ee.Geometry.Rectangle([45, -90, 90, 90]);
+var geometry7 = ee.Geometry.Rectangle([90, -90, 135, 90]);
+var geometry8 = ee.Geometry.Rectangle([135, -90, 180, 90]);
+
+//******************************************Export the upper and lower DHIs******************************************
+// part 1
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+
+// part 2
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+// part 3
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+// part 4
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+
+// part 5
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+// part 6
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+// part 7
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+
+// part 8
+//upper
+Export.image.toDrive({
+ image:upper_CumDHI,
+ description: 'upper_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:upper_MinDHI,
+   description: 'upper_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:upper_VarDHI,
+   description: 'upper_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//lower
+Export.image.toDrive({
+ image:lower_CumDHI,
+ description: 'lower_CumDHI_MODIS_Terr_LAI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_orginal_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:lower_MinDHI,
+   description: 'lower_MinDHI_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:lower_VarDHI,
+   description: 'lower_VarDHI_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_orginal_uncertainty'
+ });
+
+//***********************************Export the absolute different DHIs***********************************
+// part 1
+//upper
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+
+// part 2
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//part 3
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//part 4
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//part 5
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//part 6
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//part 7
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//part 8
+Export.image.toDrive({
+ image:abs_Cum_diff,
+ description: 'abs_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_abs_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:abs_Min_diff,
+   description: 'abs_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:abs_Var_diff,
+   description: 'abs_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_abs_uncertainty'
+ });
+
+//***********************************Export the relative different DHIs***********************************
+// part 1
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 2 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 3 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 4 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 5 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 6 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 7 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
+
+// part 8 
+Export.image.toDrive({
+ image:relative_Cum_diff,
+ description: 'relative_Cum_diff_MODIS_Terr_LAI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13,
+ folder:'Terra_LAI_relative_uncertainty'
+});
+  
+ Export.image.toDrive({
+   image:relative_Min_diff,
+   description: 'relative_Min_diff_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty',
+ });
+
+ Export.image.toDrive({
+   image:relative_Var_diff,
+   description: 'relative_Var_diff_MODIS_Terr_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+   folder:'Terra_LAI_relative_uncertainty'
+ });
