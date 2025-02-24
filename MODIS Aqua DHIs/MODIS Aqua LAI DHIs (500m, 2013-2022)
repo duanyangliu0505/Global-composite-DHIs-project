@@ -1,0 +1,405 @@
+/* 
+Objective: Generate the MODSI Collection 6.1 Aqua LAI 500m 2013 - 2022 DHIs
+Authors: Duanyang Liu, Duda, Elena
+Date: 2023-03-29
+*/
+var StartDate = '2013-01-01';
+var EndDate= '2022-12-31';
+
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+// Select the QA band.
+  var qa = image.select('FparLai_QC')
+  var cloud=qa.bitwiseAnd(1 << 3).or(qa.bitwiseAnd(1 << 4));     // significant cloud  [01] [3-4 bits]
+            //.or(qa.bitwiseAnd(1 << 4).and(qa.bitwiseAnd(0 << 3)));  // mixed cloud  [10] [3-4 bits]
+  // Return an image masking out cloudy areas.
+  return image.updateMask(cloud.not());
+}
+
+//A function to remove water.
+var maskWater = function(image) {
+  // Select the QA band.
+  var qa = image.select('FparExtra_QC')
+  // Make a mask to get bit 10, the internal_cloud_algorithm_flag bit.
+      var water=qa.bitwiseAnd(1 << 1).and(qa.bitwiseAnd(0 << 0))
+      .or(qa.bitwiseAnd(1 << 1).and(qa.bitwiseAnd(0 << 1)));
+  //var water=qa.bitwiseAnd(1 << 13) // 100,101,110,111 [11-13bits]
+  //          .or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(0 << 12)).and(qa.bitwiseAnd(0 << 11))) //000 [11-13bits] shallow ocean
+//.or(qa.bitwiseAnd(0 << 13).and(qa.bitwiseAnd(1 << 12)).and(qa.bitwiseAnd(1 << 11)));  // 011 [11-13 bits] shallow inland water
+  // Return an image masking out cloudy areas.
+  return image.updateMask(water.not());
+}
+
+// select pixel with success main (RT) method
+var scfmask = function (image){
+  var qa = image.select('FparLai_QC')
+  var scf_qc = qa.bitwiseAnd(1<<6).or(qa.bitwiseAnd(1<<7));
+  return image.updateMask(scf_qc.not());
+}
+
+//Select pixel with snow [bit 2]
+var Snow = function(image) {
+  var qa = image.select('FparExtra_QC');
+  var snowMask = qa.bitwiseAnd(1 << 2).rename('SnowMask');
+  return image.addBands(snowMask)
+}
+
+//Assign NDVI=0.0001 for pixels with snow/ice 
+var removesnow=function(image){
+  var snow = image.select('SnowMask');
+  var ndvitemp=image.select('Lai_500m');
+  var snowzero= ndvitemp.where(ndvitemp.eq(0.0001),0)
+return snowzero
+}
+
+//Replace all negative NDVI by 0, because 0<NDVI<1 for vegetation
+var ndvipos=function(image){
+  var ndvitemp=image.select('Lai_500m');
+  return image.where(ndvitemp.lt(0),0)  
+};
+
+var qa_band = ee.ImageCollection('MODIS/061/MYD15A2H')
+              .filterDate(StartDate,EndDate)
+              .select('FparLai_QC');
+Map.addLayer(qa_band,{},'qa_band');
+
+var fPAR_col= ee.ImageCollection('MODIS/061/MYD15A2H')
+                  .filterDate(StartDate,EndDate)
+                  //.filterBounds(AOI)
+                  .map(maskClouds)
+                  .map(maskWater)
+                  .map(scfmask)
+                  .map(Snow)
+                  .map(removesnow) 
+                  .select('Lai_500m')
+                  .map(ndvipos);
+Map.addLayer(fPAR_col,{},'fPAR_col');
+var fPARJan=fPAR_col.first()
+//Map.addLayer(ndviJan,{},'January');
+
+
+var fPAR_initial= ee.ImageCollection('MODIS/061/MYD15A2H')
+                  .filterDate(StartDate,EndDate)
+                  .select('Lai_500m')
+Map.addLayer(fPAR_initial,{},'fPAR_initial');
+
+var year = 2013
+//Select median value over the 11 years at each of the time steps of the MODIS product
+var date = ee.List([ 1, 9, 17, 25, 33, 41, 49, 57, 65,73, 81,89, 97,105, 113,121, 129,137, 145, 153,
+161,169, 177,185, 193,201, 209,217, 225, 233, 241, 249, 257,265, 273,281, 289,297, 305, 313, 321, 329, 337,345, 353, 361]);
+var byDate = ee.ImageCollection.fromImages(
+  date.map(function (m) {
+    var fPAR_median = fPAR_col
+        .filter(ee.Filter.calendarRange(m, m, 'day_of_year'))
+        .median();
+    return fPAR_median
+        .set('date', m)
+        //.set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+}));
+print(byDate, 'byDate');
+Map.addLayer (byDate, { }, 'byDate');
+//Calculate statistics for EVI                
+var fPAR_stats = byDate.reduce(ee.Reducer.min())
+    .addBands(byDate.reduce(ee.Reducer.stdDev()))
+    .addBands(byDate.reduce(ee.Reducer.sum()))
+    .addBands(byDate.reduce(ee.Reducer.mean()))
+    .addBands(byDate.reduce(ee.Reducer.count())); 
+
+//the DHIs
+var CumDHI=fPAR_stats.select(2).rename('DHI_cum')
+Map.addLayer (CumDHI, { }, 'CumDHI');
+
+var MinDHI=fPAR_stats.select(0).rename('DHI_min')
+Map.addLayer (MinDHI, {}, 'MinDHI');
+
+var stdDev = fPAR_stats.select(1)
+Map.addLayer(stdDev, {},'stdDev');
+var VarDHI=fPAR_stats.select(1).divide(fPAR_stats.select(3)).rename('DHI_var')
+Map.addLayer(VarDHI, {},'VarDHI');
+
+// mask water body by using MOD44W product
+var dataset = ee.ImageCollection('MODIS/006/MOD44W')
+                 .filter(ee.Filter.date('2015-01-01', '2015-05-01'));
+var waterMask = dataset.select('water_mask');
+var waterMaskVis = {
+  min: 0.0,
+  max: 1.0,
+  palette: ['bcba99', '2d0491'],
+};
+//Map.setCenter(6.746, 46.529, 2);
+//Map.addLayer(waterMask, waterMaskVis, 'Water Mask');
+
+var apllymask = waterMask.reduce(ee.Reducer.mean()).lt(1)
+var CumDHI_mask6=CumDHI.updateMask(apllymask).float();
+var MinDHI_mask6=MinDHI.updateMask(apllymask).float();
+var VarDHI_mask6=VarDHI.updateMask(apllymask).float();
+
+// Cum and Min DHIs scaled to [0, 100]
+var CumDHI6_scaled = CumDHI_mask6.divide(10).divide(460).multiply(100)
+//var CumDHI6_scaled = CumDHI_mask6.divide(10000).divide(23).multiply(100)
+//var CumDHI_VIIRS_scaled = CumDHI_maskV.divide(10000).divide(23).multiply(100)
+Map.addLayer (CumDHI6_scaled, { }, 'CumDHI6_scaled');
+var MinDHI6_scaled = MinDHI_mask6.divide(10).divide(10).multiply(100)
+//var MinDHI6_scaled = MinDHI_mask6.divide(10000).divide(1).multiply(100)
+//var MinDHI_VIIRS_scaled = MinDHI_maskV.divide(10000).divide(1).multiply(100)
+Map.addLayer (MinDHI6_scaled, {}, 'MinDHI6_scaled');
+var VarDHI6_scaled = VarDHI_mask6
+//var VarDHI6_scaled = VarDHI_mask6.divide(10)
+//var VarDHI_VIIRS_scaled = VarDHI_maskV.divide(10)
+Map.addLayer(VarDHI6_scaled, {},'VarDHI6_scaled');
+var geometry1 = ee.Geometry.Rectangle([-180, -90, -135, 90]);
+var geometry2 = ee.Geometry.Rectangle([-135, -90, -90, 90]);
+var geometry3 = ee.Geometry.Rectangle([-90, -90, -45, 90]);
+var geometry4 = ee.Geometry.Rectangle([-45, -90, 0, 90]);
+var geometry5 = ee.Geometry.Rectangle([0, -90, 45, 90]);
+var geometry6 = ee.Geometry.Rectangle([45, -90, 90, 90]);
+var geometry7 = ee.Geometry.Rectangle([90, -90, 135, 90]);
+var geometry8 = ee.Geometry.Rectangle([135, -90, 180, 90]);
+
+// part 1
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part1',
+ scale: 500,
+ region: geometry1,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part1',
+   scale: 500,
+   region: geometry1,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 2
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part2',
+ scale: 500,
+ region: geometry2,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part2',
+   scale: 500,
+   region: geometry2,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 3
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part3',
+ scale: 500,
+ region: geometry3,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part3',
+   scale: 500,
+   region: geometry3,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 4
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part4',
+ scale: 500,
+ region: geometry4,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part4',
+   scale: 500,
+   region: geometry4,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 5
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part5',
+ scale: 500,
+ region: geometry5,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part5',
+   scale: 500,
+   region: geometry5,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 6
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part6',
+ scale: 500,
+ region: geometry6,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part6',
+   scale: 500,
+   region: geometry6,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 7
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part7',
+ scale: 500,
+ region: geometry7,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part7',
+   scale: 500,
+   region: geometry7,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+
+// part 8
+Export.image.toDrive({
+ image:CumDHI6_scaled,
+ description: 'CumDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part8',
+ scale: 500,
+ region: geometry8,
+ crs: "EPSG:4326", 
+ //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+ maxPixels:1e13
+});
+  
+ Export.image.toDrive({
+   image:MinDHI6_scaled,
+   description: 'MinDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
+  
+ Export.image.toDrive({
+   image:VarDHI6_scaled,
+   description: 'VarDHI61_scaled_MODIS_Aqua_LAI_500m_2013-2022_part8',
+   scale: 500,
+   region: geometry8,
+   crs: "EPSG:4326",
+   //crsTransform: [0.008333333332588566, 0, 85.14308993755458, 0, -0.008333333332588566, 29.999999996999996],
+   maxPixels:1e13,
+ });
